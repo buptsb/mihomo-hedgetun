@@ -1,0 +1,110 @@
+# Builds mihomo with the hedgetun proxy group (this fork's hedgetun branch)
+# for linux/amd64 and darwin/arm64 on every push to hedgetun; a tag push
+# (hedgetun-*) also publishes a GitHub Release. It replaces hedgetun's own CI
+# (hedgetun D55).
+#
+# hedgetun is a private submodule (third_party/hedgetun, an ssh URL in
+# .gitmodules): the checkout reads it over https with the secret
+# HEDGETUN_TOKEN, a fine-grained token with read-only Contents access to
+# buptsb/hedgetun.
+name: hedgetun
+
+on:
+  push:
+    branches:
+      - hedgetun
+    tags:
+      - "hedgetun-*"
+  workflow_dispatch:
+
+concurrency:
+  group: hedgetun-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    env:
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+      CGO_ENABLED: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags, for the mihomo version
+          # No stored job token: its auth header for github.com would
+          # override HEDGETUN_TOKEN on the submodule fetch.
+          persist-credentials: false
+
+      - name: Submodule (hedgetun)
+        env:
+          HEDGETUN_TOKEN: ${{ secrets.HEDGETUN_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HEDGETUN_TOKEN" ]; then
+            echo "::error::secret HEDGETUN_TOKEN is not set (read access to buptsb/hedgetun)"
+            exit 1
+          fi
+          git config --global url."https://x-access-token:${HEDGETUN_TOKEN}@github.com/".insteadOf "git@github.com:"
+          git submodule update --init third_party/hedgetun
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: |
+          set -euxo pipefail
+          BASE=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || echo mihomo)
+          FORK=$(git rev-parse --short=8 HEAD)
+          HEDGETUN=$(git -C third_party/hedgetun rev-parse --short HEAD)
+          mkdir -p bin
+          go build -tags with_gvisor -trimpath -ldflags "\
+            -X 'github.com/metacubex/mihomo/constant.Version=${BASE}-hedgetun-${FORK}' \
+            -X 'github.com/metacubex/mihomo/constant.BuildTime=$(date -u)' \
+            -X hedgetun/internal/app.GitCommit=${HEDGETUN} \
+            -w -s -buildid=" \
+            -o "bin/mihomo-hedgetun-${GOOS}-${GOARCH}" .
+          (cd bin && sha256sum * > SHA256SUMS)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mihomo-hedgetun-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: bin/
+          if-no-files-found: error
+
+  # Only tag pushes (git tag hedgetun-… && git push github hedgetun-…)
+  # create a Release; branch pushes leave the binaries as run artifacts.
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Package
+        run: |
+          set -euxo pipefail
+          cd dist
+          for d in */; do
+            t="${d%/}"
+            tar -czf "${t}-${GITHUB_REF_NAME}.tar.gz" -C "$t" .
+          done
+          sha256sum *.tar.gz > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
