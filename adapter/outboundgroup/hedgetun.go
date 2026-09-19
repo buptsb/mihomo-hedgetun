@@ -21,21 +21,18 @@ import (
 	"hedgetun/hedgeconn"
 )
 
-type HedgeTunOption struct {
-	// MaxPaths bounds how many members the tunnel dials (default 8; the
-	// server accepts server_opts.max_paths per tunnel).
-	MaxPaths int `group:"max-paths,omitempty"`
-}
-
-const hedgeTunDefaultMaxPaths = 8
+// hedgeTunMaxPaths is how many members a tunnel can dial (connection ids
+// are one byte); the server accepts server_opts.max_paths of them.
+const hedgeTunMaxPaths = 255
 
 var errHedgeTunUDP = errors.New("hedgetun carries TCP only")
 
 // HedgeTun is a hedgetun client as a proxy group: one tunnel to a hedgetun
-// server, kept up over the group's members, each a relay the tunnel keeps
-// a connection through. Every connection routed to the group becomes a
-// tunnel session; the tunnel sends it on the best members and copies it
-// onto others when one is late (third_party/hedgetun, hedgeconn).
+// server with a connection through every member (the available set). The
+// best sched.max_selected_paths members by round trip (the workset, default
+// 8) carry traffic, and the active set is chosen within the workset. Every
+// connection routed to the group becomes a tunnel session
+// (third_party/hedgetun, hedgeconn).
 type HedgeTun struct {
 	*GroupBase
 	state *hedgeTunState
@@ -47,12 +44,11 @@ type HedgeTun struct {
 // stops the tunnel, like outbound.NewAutoCloseProxyAdapter does for
 // proxies. Connections hold the group, so they keep the tunnel.
 type hedgeTunState struct {
-	name     string
-	gb       *GroupBase
-	cfg      *hedgeconn.Config
-	maxPaths int
-	ctx      context.Context
-	cancel   context.CancelFunc
+	name   string
+	gb     *GroupBase
+	cfg    *hedgeconn.Config
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	mu     sync.Mutex
 	client *hedgeconn.Client
@@ -172,9 +168,8 @@ func (s *hedgeTunState) warm() {
 	}
 }
 
-// members are the relays: the group's proxies in order, one per server
-// address, at most maxPaths. COMPATIBLE (an empty group's fallback) is no
-// relay.
+// members are the relays: the group's proxies, one per server address.
+// COMPATIBLE (an empty group's fallback) is no relay.
 func (s *hedgeTunState) members() []string {
 	var names []string
 	seen := map[string]bool{}
@@ -189,7 +184,7 @@ func (s *hedgeTunState) members() []string {
 			seen[addr] = true
 		}
 		names = append(names, p.Name())
-		if len(names) == s.maxPaths {
+		if len(names) == hedgeTunMaxPaths {
 			break
 		}
 	}
@@ -246,14 +241,10 @@ func (s *hedgeTunState) close() {
 	}
 }
 
-func NewHedgeTun(option GroupCommonOption, hedgeTunOption HedgeTunOption, config map[string]any, emptyFallback C.Proxy, providers []P.ProxyProvider) (*HedgeTun, error) {
+func NewHedgeTun(option GroupCommonOption, config map[string]any, emptyFallback C.Proxy, providers []P.ProxyProvider) (*HedgeTun, error) {
 	cfg, err := hedgeconn.ParseConfig(config)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", option.Name, err)
-	}
-	maxPaths := hedgeTunOption.MaxPaths
-	if maxPaths <= 0 {
-		maxPaths = hedgeTunDefaultMaxPaths
 	}
 	gb := NewGroupBase(GroupBaseOption{
 		Name:           option.Name,
@@ -269,7 +260,7 @@ func NewHedgeTun(option GroupCommonOption, hedgeTunOption HedgeTunOption, config
 		Providers:      providers,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
-	state := &hedgeTunState{name: option.Name, gb: gb, cfg: cfg, maxPaths: maxPaths, ctx: ctx, cancel: cancel}
+	state := &hedgeTunState{name: option.Name, gb: gb, cfg: cfg, ctx: ctx, cancel: cancel}
 	h := &HedgeTun{GroupBase: gb, state: state}
 	// Stopping waits for the tunnel's goroutines; keep that off the
 	// runtime's single finalizer goroutine.
