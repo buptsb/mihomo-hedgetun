@@ -1,20 +1,17 @@
-# Builds mihomo with the hedgetun proxy group (this fork's hedgetun branch)
-# for linux/amd64 and darwin/arm64 on every push to hedgetun; a tag push
-# (hedgetun-*) also publishes a GitHub Release. It replaces hedgetun's own CI
-# (hedgetun D55).
+# Disabled (D56, reversing D55): CI moved back to the private buptsb/hedgetun
+# repo — its release workflow fetches this public fork (branch hedgetun) and
+# overlays the hedgetun commit that triggered the run, so builds run (and
+# their logs/artifacts stay) in the private repo and no token is needed on
+# either side. This workflow now runs only when started by hand (Actions tab,
+# "Run workflow"); a run on a hedgetun-* tag still publishes a Release.
 #
-# hedgetun is a private submodule (third_party/hedgetun, an ssh URL in
-# .gitmodules): the checkout reads it over https with the secret
-# HEDGETUN_TOKEN, a fine-grained token with read-only Contents access to
+# Manual runs still need the secret HEDGETUN_TOKEN: hedgetun is a private
+# submodule (third_party/hedgetun, an ssh URL in .gitmodules), read over
+# https with a fine-grained token with read-only Contents access to
 # buptsb/hedgetun.
 name: hedgetun
 
 on:
-  push:
-    branches:
-      - hedgetun
-    tags:
-      - "hedgetun-*"
   workflow_dispatch:
 
 concurrency:
