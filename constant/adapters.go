@@ -30,6 +30,7 @@ const (
 	Fallback
 	URLTest
 	LoadBalance
+	HedgeTun
 
 	Shadowsocks
 	ShadowsocksR
@@ -252,6 +253,8 @@ func (at AdapterType) String() string {
 		return "URLTest"
 	case LoadBalance:
 		return "LoadBalance"
+	case HedgeTun:
+		return "HedgeTun"
 	default:
 		return "Unknown"
 	}
