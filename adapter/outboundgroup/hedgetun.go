@@ -14,6 +14,7 @@ import (
 
 	"github.com/metacubex/mihomo/adapter/outbound"
 	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
 	"github.com/metacubex/mihomo/log"
@@ -134,19 +135,25 @@ func (s *hedgeTunState) start() (*hedgeconn.Client, error) {
 	if s.ctx.Err() != nil {
 		return nil, net.ErrClosed
 	}
-	names := s.members()
-	if len(names) == 0 {
+	members := s.members()
+	if len(members) == 0 {
 		return nil, errors.New("no members yet")
 	}
-	paths := make([]hedgeconn.Path, len(names))
-	for i, name := range names {
-		paths[i] = hedgeconn.Path{Name: name, Dial: s.dialer(name)}
+	paths := make([]hedgeconn.Path, len(members))
+	for i, m := range members {
+		paths[i] = hedgeconn.Path{Name: m.name, Addr: m.addr, Dial: s.dialer(m.name)}
 	}
 	cl, err := hedgeconn.Start(s.ctx, s.cfg, paths)
 	if err != nil {
 		return nil, err
 	}
+	names := cl.Paths()
 	log.Infoln("[%s] hedgetun to %s over %d members: %v", s.name, s.cfg.Server(), len(names), names)
+	// Members that share a machine with an earlier one are not relays of
+	// their own: one box, one uplink, so a copy through each is no copy.
+	for _, a := range cl.Aliases() {
+		log.Infoln("[%s] %s is another name for %s — not dialed", s.name, a.Name, a.Same)
+	}
 	s.client, s.paths = cl, names
 	return cl, nil
 }
@@ -168,27 +175,66 @@ func (s *hedgeTunState) warm() {
 	}
 }
 
+// member is one candidate relay: a proxy's name and the address it dials.
+type member struct{ name, addr string }
+
 // members are the relays: the group's proxies, one per server address.
 // COMPATIBLE (an empty group's fallback) is no relay.
-func (s *hedgeTunState) members() []string {
-	var names []string
+//
+// The address is the one written in the config, so this only drops proxies
+// configured identically. Names that resolve to one machine are the common
+// case in a subscription (bgp04 and bgp10 of one provider are often one
+// box); hedgeconn.Start resolves the addresses and drops those (D60).
+func (s *hedgeTunState) members() []member {
+	var out []member
 	seen := map[string]bool{}
 	for _, p := range s.gb.GetProxies(false) {
 		if p.Type() == C.Compatible {
 			continue
 		}
-		if addr := p.Addr(); addr != "" {
+		addr := p.Addr()
+		if addr != "" {
 			if seen[addr] {
 				continue
 			}
 			seen[addr] = true
 		}
-		names = append(names, p.Name())
-		if len(names) == hedgeTunMaxPaths {
+		out = append(out, member{name: p.Name(), addr: addr})
+		if len(out) == hedgeTunMaxPaths {
 			break
 		}
 	}
-	return names
+	return out
+}
+
+// relayIPs resolves a relay's host exactly as mihomo does when it dials a
+// proxy, so that the identity hedgeconn tells relays apart by is the machine
+// the group will really connect to: the proxy-server resolver answers with
+// real addresses even when mihomo's own DNS hands out fake IPs, and
+// resolver.LookupIPWithResolver falls back to mihomo's system resolver when
+// there is no DNS config. It must never reach net.DefaultResolver: main
+// replaces its dialer with one that dumps every stack and exits.
+func relayIPs(ctx context.Context, host string) ([]net.IP, error) {
+	r := resolver.ProxyServerHostResolver
+	if r == nil {
+		r = resolver.DefaultResolver
+	}
+	if r == nil && resolver.SystemResolver == nil {
+		return nil, errors.New("no resolver yet") // hedgeconn keeps the path
+	}
+	addrs, err := resolver.LookupIPWithResolver(ctx, host, r)
+	if err != nil {
+		return nil, err
+	}
+	return toIPs(addrs), nil
+}
+
+func toIPs(addrs []netip.Addr) []net.IP {
+	ips := make([]net.IP, 0, len(addrs))
+	for _, a := range addrs {
+		ips = append(ips, a.Unmap().AsSlice())
+	}
+	return ips
 }
 
 // dialer connects to the hedgetun server through the member named name, as
@@ -259,6 +305,7 @@ func NewHedgeTun(option GroupCommonOption, config map[string]any, emptyFallback 
 		EmptyFallback:  emptyFallback,
 		Providers:      providers,
 	})
+	cfg.SetLookup(relayIPs)
 	ctx, cancel := context.WithCancel(context.Background())
 	state := &hedgeTunState{name: option.Name, gb: gb, cfg: cfg, ctx: ctx, cancel: cancel}
 	h := &HedgeTun{GroupBase: gb, state: state}
