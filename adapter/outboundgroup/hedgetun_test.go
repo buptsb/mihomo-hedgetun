@@ -8,7 +8,39 @@ import (
 	"testing"
 
 	"github.com/metacubex/mihomo/common/yaml"
+	P "github.com/metacubex/mihomo/constant/provider"
 )
+
+// fakeProvider stands in for a subscription provider at a point of its
+// life: what feeds it, and how many loads it has completed.
+type fakeProvider struct {
+	vehicle P.VehicleType
+	version uint32
+}
+
+func (f fakeProvider) VehicleType() P.VehicleType { return f.vehicle }
+func (f fakeProvider) Version() uint32            { return f.version }
+
+// TestProvidersReady covers the D63 gate: the tunnel must not fix its
+// member list while a used subscription is still on its first load.
+func TestProvidersReady(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		in   []fakeProvider
+		want bool
+	}{
+		{"none used", nil, true},
+		{"one still loading", []fakeProvider{{P.HTTP, 0}}, false},
+		{"one loaded", []fakeProvider{{P.HTTP, 1}}, true},
+		{"second still loading", []fakeProvider{{P.HTTP, 1}, {P.HTTP, 0}}, false},
+		{"both loaded", []fakeProvider{{P.HTTP, 2}, {P.HTTP, 1}}, true},
+		{"compatible never loads", []fakeProvider{{P.Compatible, 0}, {P.HTTP, 1}}, true},
+	} {
+		if got := providersReady(tt.in); got != tt.want {
+			t.Errorf("%s: providersReady = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
 
 // TestRelayIPsOverSubscription resolves a real subscription the way the
 // group does and prints the machines behind its relays: a subscription

@@ -26,6 +26,11 @@ import (
 // are one byte); the server accepts server_opts.max_paths of them.
 const hedgeTunMaxPaths = 255
 
+// hedgeTunProviderGrace bounds how long the tunnel may start without a
+// provider that has not finished its first load: its fetch can hang, and
+// it must not hold every connection hostage for good.
+const hedgeTunProviderGrace = 30 * time.Second
+
 var errHedgeTunUDP = errors.New("hedgetun carries TCP only")
 
 // HedgeTun is a hedgetun client as a proxy group: one tunnel to a hedgetun
@@ -45,11 +50,13 @@ type HedgeTun struct {
 // stops the tunnel, like outbound.NewAutoCloseProxyAdapter does for
 // proxies. Connections hold the group, so they keep the tunnel.
 type hedgeTunState struct {
-	name   string
-	gb     *GroupBase
-	cfg    *hedgeconn.Config
-	ctx    context.Context
-	cancel context.CancelFunc
+	name      string
+	gb        *GroupBase
+	cfg       *hedgeconn.Config
+	providers []P.ProxyProvider
+	created   time.Time
+	ctx       context.Context
+	cancel    context.CancelFunc
 
 	mu     sync.Mutex
 	client *hedgeconn.Client
@@ -139,6 +146,12 @@ func (s *hedgeTunState) start() (*hedgeconn.Client, error) {
 	if len(members) == 0 {
 		return nil, errors.New("no members yet")
 	}
+	if !providersReady(s.providers) {
+		if time.Since(s.created) < hedgeTunProviderGrace {
+			return nil, errors.New("providers still loading")
+		}
+		log.Warnln("[%s] starting without every provider loaded", s.name)
+	}
 	paths := make([]hedgeconn.Path, len(members))
 	for i, m := range members {
 		paths[i] = hedgeconn.Path{Name: m.name, Addr: m.addr, Dial: s.dialer(m.name)}
@@ -158,8 +171,9 @@ func (s *hedgeTunState) start() (*hedgeconn.Client, error) {
 	return cl, nil
 }
 
-// warm starts the tunnel as soon as the providers have members, so the
-// first connection does not wait for its handshakes.
+// warm starts the tunnel as soon as every provider has loaded and the
+// group has members, so the first connection does not wait for its
+// handshakes.
 func (s *hedgeTunState) warm() {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
@@ -173,6 +187,32 @@ func (s *hedgeTunState) warm() {
 			return
 		}
 	}
+}
+
+// providerLoad is the part of a provider the tunnel waits on: what kind of
+// vehicle feeds it, and whether its first load has completed.
+type providerLoad interface {
+	VehicleType() P.VehicleType
+	Version() uint32
+}
+
+// providersReady reports whether every subscription the group uses has
+// finished its first load (Version counts loads, so 0 is "not yet"). The
+// executor initializes providers one by one, and the member list is fixed
+// the moment the tunnel starts (D52), so the first provider done must not
+// fix it alone: with two subscriptions, the one with a hundred lines
+// loaded 8 ms before the one with two thousand, and the tunnel came up
+// over the small one only (D63).
+func providersReady[Pd providerLoad](ps []Pd) bool {
+	for _, pd := range ps {
+		if pd.VehicleType() == P.Compatible {
+			continue // holds the config's own proxies, loaded at once
+		}
+		if pd.Version() == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // member is one candidate relay: a proxy's name and the address it dials.
@@ -307,7 +347,15 @@ func NewHedgeTun(option GroupCommonOption, config map[string]any, emptyFallback 
 	})
 	cfg.SetLookup(relayIPs)
 	ctx, cancel := context.WithCancel(context.Background())
-	state := &hedgeTunState{name: option.Name, gb: gb, cfg: cfg, ctx: ctx, cancel: cancel}
+	state := &hedgeTunState{
+		name:      option.Name,
+		gb:        gb,
+		cfg:       cfg,
+		providers: providers,
+		created:   time.Now(),
+		ctx:       ctx,
+		cancel:    cancel,
+	}
 	h := &HedgeTun{GroupBase: gb, state: state}
 	// Stopping waits for the tunnel's goroutines; keep that off the
 	// runtime's single finalizer goroutine.
